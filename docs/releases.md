@@ -1,15 +1,16 @@
 # Cutting an Omarchy release
 
-The release train runs from `bin/omarchy-release`. Nothing in the GitHub
-workflows promotes a channel: its channel moves and RC builds were written to
-execute on the old repository host, which is abandoned (see
+The release train runs from `bin/omarchy-release`. Channels move with the
+**Promote channel** workflow ([below](#promoting-a-channel)); the RC build
+was written to execute on the old repository host, which is abandoned (see
 [repository-host.md](repository-host.md)), against a local copy of the
 published tree.
 
-> `rc` and `ship` build the release pair with `bin/repo release` and move
-> channels with `bin/repo advance`, on the machine that holds the published
-> tree. No workflow replaces them yet. That machine's tree has to match the
-> bucket first: `advance` reads the source channel from local disk.
+> `rc` builds the release pair with `bin/repo release`, and `ship` still
+> promotes with `bin/repo advance`, on the machine that holds the published
+> tree. No workflow replaces the RC build yet. Promote with the workflow
+> instead of letting `ship` run `advance`: that reads the source channel
+> from local disk.
 
 `bin/omarchy-release` is the front door. A release train has three human
 moments, each one command — and bare `omarchy-release` observes reality
@@ -34,26 +35,25 @@ and the GitHub release exists. Finish a failed ISO or website step by hand.
 
 ## Promoting a channel
 
-Ship the tested rc channel to stable (copies packages + signatures, then
-cleans, rebuilds the database, and syncs):
+Run **Promote channel** (`.github/workflows/promote.yml`) from the Actions
+tab. It works on the bucket directly, both architectures, inside the same
+lock as merges, and records who ran it and what moved; see
+[Promote a channel](../README.md#promote-a-channel) for what it holds back.
 
-```
-bin/repo advance --from rc --to stable --arch all
-```
+Carry what has landed on edge into rc, so RC testing runs against the
+package set stable users will get:
 
-Open a release train that ships new edge packages by carrying edge into rc
-first:
-
-```
-bin/repo advance --from edge --to rc --arch all
+```bash
+gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="edge -> rc"
 ```
 
-`advance` moves x86_64 alone unless given `--arch`. `--arch all` covers the
-architectures in `PUBLISHED_ARCHES` (`helpers/paths.sh`), x86_64 only by
-default; set `OMARCHY_ARCHES="x86_64 aarch64"` on the machine that runs it to
-promote both. The variable is not carried over when `bin/repo` forwards a
-command over ssh, and `omarchy-release ship` promotes through the same path. It refuses to
-carry a package into a channel its `channels` metadata excludes.
+Ship the tested rc channel to stable, the release pair included:
+
+```bash
+gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="rc -> stable"
+```
+
+Add `-f dry_run=true` to see the plan first.
 
 ## The pin engine
 
@@ -107,12 +107,11 @@ bin/omarchy-pkgs self-test               # Version normalization + ordering test
   `omarchy` package against the package set stable users will actually get.
   Stable never sees an rc version; rc testers upgrade rc1 → rc2 → final
   naturally.
-- **Finals build into rc, then the whole channel promotes.** After testing, the
-  ship step promotes the exact tested artifacts (packages and signatures)
-  forward:
+- **Finals build into rc, then the whole channel promotes.** After testing,
+  the exact tested packages move forward:
 
 ```bash
-bin/repo advance --from rc --to stable --arch all
+gh workflow run promote.yml -R omacom/omarchy-pkgs -f direction="rc -> stable"
 ```
 
 Neither package is on the `fast` ring, and `bin/omarchy-pkgs` never touches

@@ -77,6 +77,7 @@ jobs:
               ./tests/superwhisper-bin-install.sh
               pacman -S --noconfirm --quiet rclone >/dev/null
               ./tests/publish-artifact.sh
+              ./tests/promote-channel.sh
               shopt -s nullglob
               for test in pkgbuilds/*/test.sh; do
                 bash "$test"
