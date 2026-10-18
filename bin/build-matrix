@@ -15,6 +15,17 @@
 #   arch is where it builds; publish_arches lists every architecture
 #   database the file goes into (all of them for arch=any). runner is the
 #   runs-on list for that build, as a JSON string (package_runner).
+#
+# A declared build group (build_with, see package_build_group) is planned as
+# one entry per architecture: naming any member plans the whole group, and
+# its members build in one `bin/build --package` run, so a member that pins
+# another to its exact version resolves against that member's fresh build
+# instead of the channel's older one. Such an entry's "package" is the
+# members' names, space-separated and sorted (bin/build orders the builds by
+# dependency itself); "id" joins them with "+"; "members" keeps each member's
+# own channels and publish_arches, which is how it is published; and
+# "channels" and "publish_arches" are their union. An entry for a package in
+# no group is exactly what it was before groups existed.
 set -euo pipefail
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/paths.sh"
@@ -26,18 +37,74 @@ for a in $ARCHES; do require_valid_arch "$a"; done
 
 if (( $# )); then names=("$@"); else mapfile -t names; fi
 
-entries=()
+# The channels <name> is published to on merge, space-separated.
+channels_for() {
+  local mirror channels=""
+  for mirror in $VALID_MIRRORS; do
+    package_builds_for_mirror "$PKGBUILDS_DIR/$1" "$mirror" && channels="$channels $mirror"
+  done
+  echo "${channels# }"
+}
+
+# Expand every name to its whole build group before anything else, so a
+# change to one member can never plan it without the others. Each group
+# appears once, in the order its first member was named.
+groups=()
+declare -A seen=()
 for name in "${names[@]}"; do
   [[ -n "$name" ]] || continue
   pkgdir="$PKGBUILDS_DIR/$name"
   [[ -d "$pkgdir" ]] || continue
+  group=$(package_build_group "$pkgdir" "$ARCHES") || exit 1
+  group=$(paste -sd' ' <<<"$group")
+  [[ -z "${seen[$group]:-}" ]] || continue
+  seen[$group]=1
+  groups+=("$group")
+done
+
+entries=()
+for group in "${groups[@]}"; do
+  read -ra members <<<"$group"
+  if (( ${#members[@]} > 1 )); then
+    # package_build_group has checked that the members build for the same
+    # architectures, on the same runners, all arch=any or none of them.
+    member_json=() union=""
+    for member in "${members[@]}"; do
+      channels=$(channels_for "$member")
+      if [[ -z "$channels" ]]; then
+        echo "build group ${group// /+}: $member is published to no channel" >&2
+        exit 1
+      fi
+      union="$union $channels"
+      member_json+=("$(jq -nc --arg p "$member" --arg c "$channels" '{package:$p, channels:$c}')")
+    done
+    channels=""
+    for mirror in $VALID_MIRRORS; do
+      [[ " $union " == *" $mirror "* ]] && channels="$channels $mirror"
+    done
+    channels=${channels# }
+    first=${members[0]}
+    if [[ " $(package_arches "$PKGBUILDS_DIR/$first" "${ARCHES%% *}") " == *" any "* ]]; then
+      plan=("${ARCHES%% *}:$ARCHES")
+    else
+      plan=()
+      for arch in $ARCHES; do
+        package_supports_arch "$PKGBUILDS_DIR/$first" "$arch" && plan+=("$arch:$arch")
+      done
+    fi
+    for item in "${plan[@]}"; do
+      arch=${item%%:*} publish_arches=${item#*:}
+      entries+=("$(printf '%s\n' "${member_json[@]}" | jq -sc --arg p "$group" --arg a "$arch" --arg c "$channels" --arg pa "$publish_arches" \
+        --arg r "$(package_runner "$first" "$arch")" --arg id "${group// /+}" \
+        '{package:$p, arch:$a, channels:$c, publish_arches:$pa, runner:$r, id:$id, members: map(. + {publish_arches:$pa})}')")
+    done
+    continue
+  fi
+  name=${members[0]}
+  pkgdir="$PKGBUILDS_DIR/$name"
   # skip_build packages still build on their own PR (explicit --package
   # semantics); only an unscoped local bin/build skips them.
-  channels=""
-  for mirror in $VALID_MIRRORS; do
-    package_builds_for_mirror "$pkgdir" "$mirror" && channels="$channels $mirror"
-  done
-  channels=${channels# }
+  channels=$(channels_for "$name")
   [[ -n "$channels" ]] || continue
   # An arch=any package produces one architecture-independent file, so it
   # builds once, on the first architecture, and that file serves every

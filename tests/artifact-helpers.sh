@@ -43,3 +43,47 @@ bash -e -c "source '$ROOT/helpers/artifact-helpers.sh'; pack_packages '$T/built'
 mkdir -p "$T/empty"
 if pack_packages "$T/empty" "$T/x.tar" 2>/dev/null; then fail "packing an empty build dir should fail"; else pass "empty build dir refused"; fi
 if unpack_packages "$T/empty" "$T/out3" 2>/dev/null; then fail "an empty artifact should fail"; else pass "empty artifact refused"; fi
+
+# artifact_label: one package keeps the label it always had; a build group
+# gets one label over every member's tree, the same whichever order the
+# members come in, and a new one when any member's tree changes.
+G="$T/repo"
+git init -q "$G"
+git -C "$G" config user.email test@example.invalid
+git -C "$G" config user.name test
+mkdir -p "$G/pkgbuilds/runtime" "$G/pkgbuilds/settings"
+echo 1 > "$G/pkgbuilds/runtime/PKGBUILD"
+echo 1 > "$G/pkgbuilds/settings/PKGBUILD"
+git -C "$G" add -A && git -C "$G" commit -qm one
+label() { (cd "$G" && artifact_label "$@"); }
+tree() { git -C "$G" rev-parse "$1:pkgbuilds/$2"; }
+[[ $(label HEAD x86_64 runtime) == "runtime-x86_64-$(tree HEAD runtime)" ]] \
+  && pass "a single package keeps its <package>-<arch>-<tree> label" || fail "single label: $(label HEAD x86_64 runtime)"
+group=$(label HEAD x86_64 runtime settings)
+[[ $group =~ ^runtime\+settings-x86_64-g1-[0-9a-f]{40}$ ]] && pass "a group label names its members and a versioned digest" || fail "group label: $group"
+[[ $(label HEAD x86_64 settings runtime) == "$group" ]] && pass "the group label does not depend on member order" || fail "member order changed the label"
+[[ $group != "$(label HEAD x86_64 runtime)" && $group != "$(label HEAD x86_64 settings)" ]] \
+  && pass "a group label is never a member's own label" || fail "group label collides with a member's"
+[[ $(label HEAD aarch64 runtime settings) != "$group" ]] && pass "the group label depends on the architecture" || fail "arch ignored"
+first=$(git -C "$G" rev-parse HEAD)
+echo 2 > "$G/pkgbuilds/settings/PKGBUILD"
+git -C "$G" commit -qam two
+[[ $(label HEAD x86_64 runtime settings) != "$group" && $(label "$first" x86_64 runtime settings) == "$group" ]] \
+  && pass "changing one member's tree changes the group label" || fail "group label ignored a member's tree"
+[[ $(label HEAD x86_64 runtime) == "runtime-x86_64-$(tree "$first" runtime)" ]] \
+  && pass "an unchanged member's own label is unchanged" || fail "single label moved"
+if label HEAD x86_64 runtime missing >/dev/null 2>&1; then fail "a label for a missing member"; else pass "a missing member has no label"; fi
+[[ $(artifact_label_query "$group") == "runtime%2Bsettings-x86_64-g1-${group##*-}" ]] \
+  && pass "the lookup query escapes the +" || fail "query: $(artifact_label_query "$group")"
+[[ $(artifact_label_query "runtime-x86_64-$(tree HEAD runtime)") == "runtime-x86_64-$(tree HEAD runtime)" ]] \
+  && pass "a single package's lookup query is the label itself" || fail "single query escaped"
+
+# One artifact carries a whole build group: every member's files, epoch
+# names included, and they all come back out of the one packages.tar.
+mkdir -p "$T/group-built" "$T/group-artifact" "$T/group-out"
+for f in runtime-4.0.5-1-x86_64.pkg.tar.zst settings-4.0.5-1-x86_64.pkg.tar.zst settings-debug-4.0.5-1-x86_64.pkg.tar.zst "$EPOCH"; do
+  echo "$f" > "$T/group-built/$f"
+done
+bash -e -c "source '$ROOT/helpers/artifact-helpers.sh'; pack_packages '$T/group-built' '$T/group-artifact/packages.tar'; unpack_packages '$T/group-artifact' '$T/group-out'" || fail "group pack"
+[[ "$(ls "$T/group-out" | sort | tr '\n' ' ')" == "$(ls "$T/group-built" | sort | tr '\n' ' ')" ]] \
+  && pass "a build group's artifact carries every member's files" || fail "group artifact: $(ls "$T/group-out" | tr '\n' ' ')"

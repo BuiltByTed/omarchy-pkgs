@@ -1,6 +1,8 @@
 name: Build changed packages
 
-# Build every package directory a PR touches, one job per package per arch:
+# Build every package directory a PR touches, one job per package per arch
+# (a declared build group is one job per arch for all its members, see
+# docs/builds.md):
 # x86_64 on the self-hosted droplet pool, aarch64 natively on GitHub's arm64
 # runners. Artifacts are unsigned; publish.yml signs and publishes them on
 # merge.
@@ -115,15 +117,18 @@ jobs:
           # build) is not built again. Pushing a fix for one package to a PR
           # that touches fifty rebuilds one, not fifty; publish.yml finds the
           # same artifacts on merge. workflow_dispatch is an explicit request
-          # and always builds.
+          # and always builds. A build group's entry is one build of all its
+          # members, labelled over every member's tree (artifact_label), so it
+          # is reused or built again as a whole.
           if [[ "${{ github.event_name }}" == pull_request ]]; then
+            source helpers/artifact-helpers.sh
             head="${{ github.event.pull_request.head.sha }}"
             kept=(); reused=()
             while read -r entry; do
               package=$(jq -r .package <<<"$entry"); arch=$(jq -r .arch <<<"$entry")
-              label="$package-$arch-$(git rev-parse "$head:pkgbuilds/$package")"
+              label=$(artifact_label "$head" "$arch" $package)
               found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$(artifact_label_query "$label")&per_page=5" \
                 | jq -r '[.artifacts[] | select(.expired|not)] | length' || echo 0)
               if (( found > 0 )); then reused+=("$label"); else kept+=("$entry"); fi
             done < <(jq -c '.include[]' <<<"$matrix")
@@ -225,31 +230,42 @@ jobs:
       # version, so the planner builds nothing and there is nothing to pack.
       # The same check publish.yml's rebuild job makes; without it the pack
       # step failed on the empty output and the required result went red.
+      # matrix.package is one package, or a build group's members
+      # space-separated: one bin/build run builds them all, in dependency
+      # order, each against the others' fresh builds. A member edge already
+      # holds at this version is left out of the plan, and of the artifact.
       - name: Build ${{ matrix.package }} (${{ matrix.arch }}, ships to ${{ matrix.channels }})
         id: build
         env:
           CONTAINER_ENGINE: docker
+          PACKAGES: ${{ matrix.package }}
         run: |
           set -euo pipefail
-          plan=$(bin/build --dry-run --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}" 2>&1 | grep -E '^==> Plan complete' || true)
-          if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
-            echo "==> ${{ matrix.package }} (${{ matrix.arch }}): edge already holds this version, nothing to build"
+          plan=$(bin/build --dry-run --mirror edge --arch "${{ matrix.arch }}" --package "$PACKAGES" 2>&1 | grep -E '^==> Plan complete' || true)
+          would=" $(sed -E 's/.*would build: *//' <<<"$plan") "
+          recipe_lines() { grep -vE '^[[:space:]]*(#|$)' || true; }
+          if [[ -n "$plan" ]]; then
+            for package in $PACKAGES; do
+              [[ "$would" != *" $package "* ]] || continue
+              echo "==> $package (${{ matrix.arch }}): edge already holds this version, nothing to build"
+              # Arch bumps pkgrel only when the built package changes, which is
+              # the reviewer's call. When the recipe itself changed (comments and
+              # blank lines aside), flag it on the PKGBUILD without failing: the
+              # change ships only once pkgver or pkgrel moves. HEAD is the base
+              # branch; the PR's package directories are overlaid on it.
+              recipe="pkgbuilds/$package/PKGBUILD"
+              if ! cmp -s <(git show "HEAD:$recipe" 2>/dev/null | recipe_lines) <(recipe_lines < "$recipe"); then
+                note="PKGBUILD changed, but edge already holds this version of $package, so the change will not ship until pkgver or pkgrel changes. Bump pkgrel if it affects the built package."
+                echo "::warning file=$recipe,title=Change will not ship::$note"
+                echo "$note" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done
+          fi
+          if [[ -n "$plan" && -z "${would//[[:space:]]/}" ]]; then
             echo "built=false" >> "$GITHUB_OUTPUT"
-            # Arch bumps pkgrel only when the built package changes, which is
-            # the reviewer's call. When the recipe itself changed (comments and
-            # blank lines aside), flag it on the PKGBUILD without failing: the
-            # change ships only once pkgver or pkgrel moves. HEAD is the base
-            # branch; the PR's package directories are overlaid on it.
-            recipe="pkgbuilds/${{ matrix.package }}/PKGBUILD"
-            recipe_lines() { grep -vE '^[[:space:]]*(#|$)' || true; }
-            if ! cmp -s <(git show "HEAD:$recipe" 2>/dev/null | recipe_lines) <(recipe_lines < "$recipe"); then
-              note="PKGBUILD changed, but edge already holds this version of ${{ matrix.package }}, so the change will not ship until pkgver or pkgrel changes. Bump pkgrel if it affects the built package."
-              echo "::warning file=$recipe,title=Change will not ship::$note"
-              echo "$note" >> "$GITHUB_STEP_SUMMARY"
-            fi
             exit 0
           fi
-          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
+          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "$PACKAGES"
           echo "built=true" >> "$GITHUB_OUTPUT"
       # The fast ring publishes this edge build to rc and stable on merge,
       # ahead of the Arch snapshot it was built against. Install it on each of
@@ -263,8 +279,14 @@ jobs:
           set -euo pipefail
           source helpers/artifact-helpers.sh
           mapfile -t files < <(package_files build-output/edge/${{ matrix.arch }})
+          # A build group is checked as the set it is installed as; a member
+          # that compiles makes the set compiled.
           compiled=()
-          grep -qE '^[[:space:]]*(function[[:space:]]+)?build[[:space:]]*(\([[:space:]]*\))?[[:space:]]*(\{|$)' "pkgbuilds/${{ matrix.package }}/PKGBUILD" && compiled=(--compiled)
+          for package in ${{ matrix.package }}; do
+            if grep -qE '^[[:space:]]*(function[[:space:]]+)?build[[:space:]]*(\([[:space:]]*\))?[[:space:]]*(\{|$)' "pkgbuilds/$package/PKGBUILD"; then
+              compiled=(--compiled)
+            fi
+          done
           bin/check-fast-ring --arch "${{ matrix.arch }}" --channels "${{ matrix.channels }}" "${compiled[@]}" "${files[@]}"
       # makepkg's check() leaves meson's per-test output in the build tree,
       # never on stdout, so a failing test shows only a summary line in this
@@ -275,18 +297,23 @@ jobs:
         if: always() && steps.build.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.package }}-${{ matrix.arch }}
+          name: test-logs-${{ matrix.id || matrix.package }}-${{ matrix.arch }}
           path: src/**/meson-logs/
           if-no-files-found: ignore
           retention-days: 14
-      # The artifact label carries the package directory's git tree hash so
-      # the publish step can find the build for exactly the tree that merged.
-      # The package file inside keeps makepkg's standard name untouched.
-      # The artifact label uses the PR head's tree for this package: that is
-      # the tree that merges, and what publish looks up.
-      - name: Tree hash
-        id: tree
-        run: echo "hash=$(git rev-parse "${{ github.event.pull_request.head.sha || github.sha }}:pkgbuilds/${{ matrix.package }}")" >> "$GITHUB_OUTPUT"
+      # The artifact label carries the package directory's git tree hash (a
+      # build group's: a digest over every member's) so the publish step can
+      # find the build for exactly the trees that merged. The package files
+      # inside keep makepkg's standard names untouched. The label uses the PR
+      # head's trees: those are what merges, and what publish looks up.
+      # helpers/artifact-helpers.sh (artifact_label) is the one definition.
+      - name: Artifact label
+        id: label
+        run: |
+          set -euo pipefail
+          source helpers/artifact-helpers.sh
+          label=$(artifact_label "${{ github.event.pull_request.head.sha || github.sha }}" "${{ matrix.arch }}" ${{ matrix.package }})
+          echo "label=$label" >> "$GITHUB_OUTPUT"
       # The upload action rejects a path containing ':', which is how makepkg
       # names a package with an epoch. The files ride inside packages.tar
       # (helpers/artifact-helpers.sh); publish.yml unpacks it. Only a
@@ -303,7 +330,7 @@ jobs:
         if: steps.build.outputs.built == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.package }}-${{ matrix.arch }}-${{ steps.tree.outputs.hash }}
+          name: ${{ steps.label.outputs.label }}
           path: packages.tar
           if-no-files-found: error
           retention-days: 7

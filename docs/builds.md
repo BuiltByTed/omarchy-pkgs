@@ -8,6 +8,8 @@ all call it.
 Within one `bin/build` run, the build system handles dependencies between the
 packages it was asked to build. CI builds each package in its own job, so a
 PR's packages do not see each other's fresh builds; they resolve from `edge`.
+Packages that must see each other's are declared as a build group (below) and
+share one job.
 
 1. Plans dependency order once, including `depends`, `makedepends`,
    `checkdepends`, and their architecture-specific arrays.
@@ -36,6 +38,49 @@ prerequisites, resumed builds, cache replacement, and deferred dependencies
 using real containers and pacman transactions. It uses the prepared builder
 image, or an image named by `TEST_BUILDER_IMAGE`; CI builds the small fixture
 image in `tests/build-isolation.Dockerfile`.
+
+## Build groups
+
+Some packages cannot build in a job of their own. `omarchy` depends on
+`omarchy-settings=${pkgver}`, an exact pin: built alone, it resolves the pin
+against `edge`, which still serves the previous `omarchy-settings`, and fails
+with `target not found: omarchy-settings=<new version>`. That is how the
+publish after the 4.0.5 ship failed on both architectures (run 39086461241):
+the matrix built `omarchy` and `omarchy-settings` in separate jobs.
+
+Such packages declare each other in `.omarchy/package.json`:
+
+```json
+{ "build_with": ["omarchy-settings"] }
+```
+
+and `omarchy-settings` declares `["omarchy"]` back. `omarchy-dev` and
+`omarchy-settings-dev` are declared the same way. Every member names every
+other member; `validate_package_metadata` and `bin/build-matrix` refuse a
+declaration that is not reciprocal, names something that is not a package,
+mixes `arch=any` with architecture-specific members, or whose members would
+build for different architectures, on different runners or on different
+release rings. A group is never split quietly.
+
+What a group changes:
+
+- `bin/build-matrix` expands every name it is given to its whole group first,
+  so a PR or merge that touches one member builds all of them, and plans one
+  entry per group per architecture. Its `package` is the members' names,
+  sorted and space-separated, which is what `bin/build --package` takes; one
+  `bin/build` run orders them by dependency and installs each fresh build for
+  the next, as above. `members` keeps each member's own `channels` and
+  `publish_arches`; `id` (`omarchy+omarchy-settings`) names the group.
+  Entries for packages in no group are unchanged.
+- The group's artifact holds every member it built, under a label over all
+  members' trees: `<a>+<b>-<arch>-g1-<digest>` (`artifact_label` in
+  `helpers/artifact-helpers.sh`, the one place labels are made). A change to
+  any member is a new label, so a group is reused or rebuilt as a whole. A
+  single package keeps its `<package>-<arch>-<tree>` label.
+- `publish.yml` unpacks the group's artifact once and publishes each member
+  to its own channels. Before the first channel is touched it checks that
+  every member is in the artifact, unless the channel itself already holds
+  that member at master's version (the build leaves such a member out).
 
 ## Daily builder images
 

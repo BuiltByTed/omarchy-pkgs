@@ -13,6 +13,7 @@
 #   { "source": "local", "channels": ["edge"] }
 #   { "source": "local", "channels": ["edge", "rc", "stable"] }
 #   { "source": "local", "min_release_age": "24h" }
+#   { "source": "local", "build_with": ["omarchy-settings"] }   (see package_build_group)
 #   { "source": "local", "auto_merge": true, "upstream": { "watch": { "git_branch": "...", "branch": "main" } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "checksums": "SHASUMS256.txt", "assets": { "x86_64": ["name-{tag}-x64.tar.xz"] } } }
 #   { "source": "local", "upstream": { "github": "owner/repo", "digests": true, "assets": { "x86_64": "name-{tag}-x64.tar.xz" } } }
@@ -613,6 +614,22 @@ validate_package_metadata() {
     return 1
   fi
 
+  if ! jq -e --arg self "$(basename "$pkgdir")" '
+    if has("build_with") | not then true
+    else .build_with | type == "array" and length > 0
+      and all(type == "string" and length > 0 and . != $self)
+      and (unique | length) == length
+    end
+  ' "$metadata" >/dev/null; then
+    echo "invalid build_with for $(basename "$pkgdir"): must be a non-empty array of other package names, each once"
+    return 1
+  fi
+  local group_error
+  if ! group_error=$(package_build_group "$pkgdir" 2>&1 >/dev/null); then
+    echo "$group_error"
+    return 1
+  fi
+
   # The fast ring ships one edge build to every channel at once, so nothing
   # rebuilds it when a channel moves under it: a package that needs those
   # rebuilds reaches rc and stable with the release instead. The rest of the
@@ -668,4 +685,104 @@ package_runner() {
   linux-*) echo '["namespace-profile-arm64-linux-apple-12x32"]' ;;
   *) echo '["ubuntu-24.04-arm"]' ;;
   esac
+}
+
+# Build groups. A package that pins another of this repository's packages to
+# its exact version (omarchy depends on "omarchy-settings=${pkgver}") cannot
+# build in a job of its own: it resolves the pin against the channel, which
+# still holds the old version, and fails "target not found" (publish run
+# 39086461241, omarchy 4.0.5). `build_with` declares such packages, and every
+# member names every other member:
+#   pkgbuilds/omarchy/.omarchy/package.json:          "build_with": ["omarchy-settings"]
+#   pkgbuilds/omarchy-settings/.omarchy/package.json: "build_with": ["omarchy"]
+# bin/build-matrix then plans the group as one entry per architecture, built
+# by one `bin/build --package a b` run, which orders the members and installs
+# each one's fresh build for the next. A group either builds as a whole or not
+# at all; anything that would split it is an error, never a quiet fallback.
+
+# package_build_with <pkgdir>: the packages <pkgdir> declares it builds with.
+package_build_with() {
+  local pkgdir="$1" metadata
+  metadata=$(metadata_file_for_dir "$pkgdir")
+  [[ -f "$metadata" ]] || return 0
+  jq -r '(.build_with // [])[]' "$metadata"
+}
+
+# package_build_group <pkgdir> [arches]: the members of the build group
+# <pkgdir> belongs to, sorted (LC_ALL=C), one per line; just its own name for
+# a package that declares none. The members are siblings of <pkgdir>. Fails,
+# with the reason on stderr, when the declaration is not one group that can
+# build in one job on every architecture in [arches] (default CI_ARCHES):
+# a member that is no package, a declaration another member does not mirror,
+# arch=any next to architecture-specific members, members that build for
+# different architectures or on different runners, or members on different
+# release rings (the fast ring would ship one half ahead of its pin).
+package_build_group() {
+  local pkgdir="$1" arches="${2:-${CI_ARCHES:-x86_64 aarch64}}"
+  local root="${pkgdir%/*}" name="${pkgdir##*/}" member arch declared want
+  local first_kind kind first_runner runner first_ring ring
+  local -a group
+
+  mapfile -t group < <({ echo "$name"; package_build_with "$pkgdir"; } | LC_ALL=C sort -u)
+  if (( ${#group[@]} == 1 )); then
+    echo "$name"
+    return 0
+  fi
+  want="${group[*]}"
+
+  for member in "${group[@]}"; do
+    if [[ ! -f "$root/$member/PKGBUILD" || ! -f "$(metadata_file_for_dir "$root/$member")" ]]; then
+      echo "invalid build_with for $name: $member is not a package here" >&2
+      return 1
+    fi
+    declared=$({ echo "$member"; package_build_with "$root/$member"; } | LC_ALL=C sort -u | paste -sd' ')
+    [[ "$declared" == "$want" ]] && continue
+    if [[ " $declared " != *" $name "* ]]; then
+      echo "invalid build_with for $name: $member does not name $name back (build_with must be reciprocal)" >&2
+    else
+      echo "invalid build_with for $name: $member declares the group [$declared], $name declares [$want]; every member must name every other member" >&2
+    fi
+    return 1
+  done
+
+  first_ring=$(package_release_ring "$root/${group[0]}")
+  for member in "${group[@]:1}"; do
+    ring=$(package_release_ring "$root/$member")
+    if [[ "$ring" != "$first_ring" ]]; then
+      echo "invalid build_with for $name: ${group[0]} and $member are on different release rings (${first_ring:-default} and ${ring:-default})" >&2
+      return 1
+    fi
+  done
+
+  for arch in $arches; do
+    first_kind="" first_runner=""
+    for member in "${group[@]}"; do
+      if [[ " $(package_arches "$root/$member" "$arch") " == *" any "* ]]; then
+        kind=any
+      elif package_supports_arch "$root/$member" "$arch"; then
+        kind=yes
+      else
+        kind=no
+      fi
+      runner=$(package_runner "$member" "$arch")
+      if [[ -z "$first_kind" ]]; then
+        first_kind=$kind first_runner=$runner
+        continue
+      fi
+      if [[ "$kind" != "$first_kind" ]]; then
+        if [[ "$kind" == any || "$first_kind" == any ]]; then
+          echo "invalid build_with for $name: ${group[0]} and $member mix arch=any with an architecture-specific package" >&2
+        else
+          echo "invalid build_with for $name: ${group[0]} and $member do not build for the same architectures ($arch)" >&2
+        fi
+        return 1
+      fi
+      if [[ "$kind" != no && "$runner" != "$first_runner" ]]; then
+        echo "invalid build_with for $name: ${group[0]} and $member build on different runners for $arch ($first_runner, $runner)" >&2
+        return 1
+      fi
+    done
+  done
+
+  printf '%s\n' "${group[@]}"
 }

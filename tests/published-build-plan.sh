@@ -66,3 +66,54 @@ for arch in x86_64 aarch64; do
   done
   printf 'PASS: %s explicit and unscoped plans skip retained archives, allow new versions and releases\n' "$arch"
 done
+
+# A build group (build_with) is planned in one run: bin/build-matrix gives
+# bin/build all its members, and publish.yml reads this plan to tell a member
+# the channel already holds from one its build must have produced. The
+# runtime pins the settings to its exact version, so with both new the
+# settings come first.
+pair() { # pair <name> <depends>
+  mkdir -p "$TEST_ROOT/pkgbuilds/$1/.omarchy"
+  printf '{"source":"local","channels":["edge"],"build_with":["%s"]}\n' "$3" > "$TEST_ROOT/pkgbuilds/$1/.omarchy/package.json"
+  cat > "$TEST_ROOT/pkgbuilds/$1/PKGBUILD" <<EOF_PKGBUILD
+pkgname=$1
+pkgver=4.0.5
+pkgrel=1
+arch=('x86_64' 'aarch64')
+depends=($2)
+EOF_PKGBUILD
+}
+pair pair-runtime "'bash' 'pair-settings=\${pkgver}'" pair-settings
+pair pair-settings "'bash'" pair-runtime
+plan_pair() { # plan_pair <arch> <repo>: the packages the plan builds, in order
+  rm -rf "$TEST_ROOT/plan"
+  ARCH="$1" MIRROR=edge DRY_RUN=true PACKAGES="pair-runtime pair-settings" \
+    PKGBUILDS_DIR="$TEST_ROOT/pkgbuilds" HELPERS_DIR="$TEST_ROOT/helpers" \
+    FINAL_OUTPUT_DIR="$2" BUILD_PLAN_DIR="$TEST_ROOT/plan" \
+    "$TEST_ROOT/build/build.sh" > "$TEST_ROOT/plan.log" 2>&1
+  paste -sd' ' "$TEST_ROOT/plan/packages"
+}
+for arch in x86_64 aarch64; do
+  repo="$TEST_ROOT/pair/$arch"
+  rm -rf "$TEST_ROOT/pair-db" "$repo"; mkdir -p "$TEST_ROOT/pair-db" "$repo"
+  db_pair() { # db_pair <name> <version>...: the channel indexes these
+    rm -rf "$TEST_ROOT/pair-db"/*
+    while (( $# )); do
+      mkdir -p "$TEST_ROOT/pair-db/$1-$2"
+      printf '%%NAME%%\n%s\n\n%%BASE%%\n%s\n\n%%VERSION%%\n%s\n' "$1" "$1" "$2" > "$TEST_ROOT/pair-db/$1-$2/desc"
+      shift 2
+    done
+    tar --zstd -cf "$repo/omarchy.db.tar.zst" -C "$TEST_ROOT/pair-db" .
+  }
+  db_pair pair-runtime 4.0.4-2 pair-settings 4.0.4-1
+  [[ $(plan_pair "$arch" "$repo") == "pair-settings pair-runtime" ]] || { cat "$TEST_ROOT/plan.log"; echo "FAIL: $arch both new: $(plan_pair "$arch" "$repo")"; exit 1; }
+  db_pair pair-runtime 4.0.4-2 pair-settings 4.0.5-1
+  [[ $(plan_pair "$arch" "$repo") == "pair-runtime" ]] || { echo "FAIL: $arch settings published: $(plan_pair "$arch" "$repo")"; exit 1; }
+  db_pair pair-runtime 4.0.4-2 pair-settings 4.0.4-1
+  touch "$repo/pair-settings-4.0.5-1-$arch.pkg.tar.zst"
+  [[ $(plan_pair "$arch" "$repo") == "pair-runtime" ]] || { echo "FAIL: $arch settings archived: $(plan_pair "$arch" "$repo")"; exit 1; }
+  db_pair pair-runtime 4.0.5-1 pair-settings 4.0.5-1
+  [[ -z $(plan_pair "$arch" "$repo") ]] || { echo "FAIL: $arch both published: $(plan_pair "$arch" "$repo")"; exit 1; }
+  grep -q 'Plan complete. Packages that would build: $' "$TEST_ROOT/plan.log" || { echo "FAIL: $arch both published: no empty plan line"; exit 1; }
+  printf 'PASS: %s build group plan: both new in dependency order, one published, both published\n' "$arch"
+done

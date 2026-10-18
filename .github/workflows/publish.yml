@@ -7,6 +7,11 @@ name: Publish merged packages
 # to. One build, one file, several databases: a filename means one set of
 # bytes everywhere, and channels are views over a shared pool.
 #
+# A declared build group (build_with; docs/builds.md) is one matrix entry per
+# arch: its members are found, or rebuilt, together as one artifact labelled
+# over all their trees (helpers/artifact-helpers.sh, artifact_label), and are
+# then published one by one, each to its own channels.
+#
 # Secrets live in the "publish" environment, restricted to master:
 #   GPG_PRIVATE_KEY, GPG_PASSPHRASE   the channel signing key
 #   R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT
@@ -61,15 +66,18 @@ jobs:
           # no build artifact (PR artifacts last 7 days; a dispatch may name
           # any package) goes to the rebuild job, on the runner build-matrix
           # names for it: the one its PR build would have had.
+          # A build group's entry is decided as a whole: one artifact holds
+          # all of it, and a rebuild builds all of it in one bin/build run.
+          source helpers/artifact-helpers.sh
           rebuild=()
           echo "| package | arch | tree | decision |" >> "$GITHUB_STEP_SUMMARY"
           echo "| --- | --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
           while read -r entry; do
             package=$(jq -r .package <<<"$entry"); arch=$(jq -r .arch <<<"$entry")
-            hash=$(git rev-parse "HEAD:pkgbuilds/$package")
-            label="$package-$arch-$hash"
+            label=$(artifact_label HEAD "$arch" $package)
+            hash=${label##*-}
             found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$(artifact_label_query "$label")&per_page=5" \
               | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | select(. != null) | "run \(.workflow_run.id), expires \(.expires_at)"')
             # The plan the publish job makes, made here before a runner is
             # asked for: a tree the channel already holds at master's version
@@ -78,6 +86,8 @@ jobs:
             # to find that out in seconds.
             plan=""
             [[ -n "$found" ]] || plan=$(bin/build --dry-run --mirror edge --arch "$arch" --package "$package" 2>&1 | grep -E '^==> Plan complete' || true)
+            # For a build group, "nothing to build" means no member needs a
+            # build: one member already published does not settle the rest.
             if [[ -n "$found" ]]; then
               decision="reuse the build artifact ($found)"
             elif [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
@@ -117,28 +127,33 @@ jobs:
       # The same check the publish job makes before building: a re-run for a
       # package the channel already holds at master's version builds
       # nothing, and uploads nothing that could shadow the published file.
+      # matrix.package is one package or a build group's members; a group
+      # builds in this one bin/build run, never split across jobs.
       - name: Build ${{ matrix.package }} (${{ matrix.arch }})
         id: build
         env:
           CONTAINER_ENGINE: docker
+          PACKAGES: ${{ matrix.package }}
         run: |
           set -euo pipefail
-          plan=$(bin/build --dry-run --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}" 2>&1 | grep -E '^==> Plan complete' || true)
+          plan=$(bin/build --dry-run --mirror edge --arch "${{ matrix.arch }}" --package "$PACKAGES" 2>&1 | grep -E '^==> Plan complete' || true)
           if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
             echo "==> ${{ matrix.package }} (${{ matrix.arch }}): already published at master's version, nothing to build"
             echo "built=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
+          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "$PACKAGES"
           echo "built=true" >> "$GITHUB_OUTPUT"
       - name: Pack artifact
         if: steps.build.outputs.built == 'true'
         id: pack
         run: |
+          set -euo pipefail
           source helpers/artifact-helpers.sh
           pack_packages build-output/edge/${{ matrix.arch }} packages.tar
           tar -tvf packages.tar
-          echo "label=${{ matrix.package }}-${{ matrix.arch }}-$(git rev-parse "HEAD:pkgbuilds/${{ matrix.package }}")" >> "$GITHUB_OUTPUT"
+          label=$(artifact_label HEAD "${{ matrix.arch }}" ${{ matrix.package }})
+          echo "label=$label" >> "$GITHUB_OUTPUT"
       - name: Upload artifact
         if: steps.build.outputs.built == 'true'
         uses: actions/upload-artifact@v4
@@ -177,15 +192,22 @@ jobs:
         with:
           persist-credentials: false
 
-      # Every matrix entry, as a file the shell steps can loop over:
-      # package arch channels publish_arches
+      # The matrix, as files the shell steps can loop over. entries.txt has
+      # one line per artifact to collect: arch, then the package or the
+      # build group's members, comma-separated. plan.txt has one line per
+      # package that is published, a group flattened into its members, each
+      # with its own routing: package arch channels publish_arches. For a
+      # package in no group the two say the same thing.
       - name: Plan
         run: |
-          jq -r '.include[] | "\(.package) \(.arch) \(.channels|gsub(" ";",")) \(.publish_arches|gsub(" ";","))"' \
-            <<'EOF_MATRIX' > plan.txt
+          set -euo pipefail
+          cat > matrix.json <<'EOF_MATRIX'
           ${{ needs.changes.outputs.matrix }}
           EOF_MATRIX
-          cat plan.txt
+          jq -r '.include[] | "\(.arch) \(.package | gsub(" ";","))"' matrix.json > entries.txt
+          jq -r '.include[] | .arch as $arch | (.members // [{package, channels, publish_arches}])[]
+            | "\(.package) \($arch) \(.channels|gsub(" ";",")) \(.publish_arches|gsub(" ";","))"' matrix.json > plan.txt
+          cat entries.txt plan.txt
 
       # Fetch each package's artifact into build-output/edge/<arch>/: the PR's,
       # or the rebuild job's when the PR's had expired. An artifact
@@ -204,11 +226,29 @@ jobs:
           # the record says so instead of the report job finding nothing.
           : > sources.jsonl
           failed=0
-          while read -r package arch channels publish_arches; do
-            hash=$(git rev-parse "HEAD:pkgbuilds/$package")
-            label="$package-$arch-$hash"
+          # record <source> <package>...: one line per package, never one per
+          # build group, so the publish step below and the report see every
+          # member.
+          record() {
+            local source=$1 member; shift
+            for member; do
+              jq -nc --arg p "$member" --arg a "$arch" --arg s "$source" '{package:$p, arch:$a, source:$s}' >> sources.jsonl
+            done
+          }
+          # would_build <package>...: the packages bin/build would build for
+          # edge, from its dry-run plan against the published channel; exit 1
+          # when there is no plan.
+          would_build() {
+            local plan
+            plan=$(CONTAINER_ENGINE=docker bin/build --dry-run --mirror edge --arch "$arch" --package "$*" 2>&1 </dev/null | grep -E '^==> Plan complete' || true)
+            [[ -n "$plan" ]] || return 1
+            sed -E 's/.*would build: *//' <<<"$plan"
+          }
+          while read -r arch list; do
+            read -ra members <<<"${list//,/ }"
+            label=$(artifact_label HEAD "$arch" "${members[@]}") || { record label-failed "${members[@]}"; failed=1; break; }
             found=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$label&per_page=5" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=$(artifact_label_query "$label")&per_page=5" \
               | jq -r '[.artifacts[] | select(.expired|not)] | sort_by(.created_at) | last | select(. != null) | "\(.archive_download_url) \(.workflow_run.id)"')
             read -r found from_run <<<"$found" || true
             mkdir -p "build-output/edge/$arch"
@@ -220,33 +260,50 @@ jobs:
                 kind=pr-artifact
                 echo "==> $label: reusing the build artifact from run $from_run"
               fi
+              # A build group's artifact is unpacked once, for all members.
               rm -rf /tmp/artifact; mkdir -p /tmp/artifact
-              if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/artifact.zip "$found" \
+              if ! { curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/artifact.zip "$found" \
                 && unzip -oq /tmp/artifact.zip -d /tmp/artifact \
-                && unpack_packages /tmp/artifact "build-output/edge/$arch"; then
-                jq -nc --arg p "$package" --arg a "$arch" --arg s "$kind" '{package:$p, arch:$a, source:$s}' >> sources.jsonl
-              else
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"artifact-download-failed"}' >> sources.jsonl; failed=1; break
+                && unpack_packages /tmp/artifact "build-output/edge/$arch"; }; then
+                record artifact-download-failed "${members[@]}"; failed=1; break
               fi
+              if (( ${#members[@]} == 1 )); then
+                record "$kind" "${members[@]}"
+                continue
+              fi
+              # A group's artifact holds only the members its build had to
+              # build: one edge already held at this version was left out. Say
+              # which, from the channel itself, not from what the artifact
+              # happens to hold. Every other member is expected in the
+              # artifact, and the publish step stops before the first slot if
+              # one is not. Without a plan, every member is expected.
+              would=" $(would_build "${members[@]}" || echo "${members[*]}") "
+              for member in "${members[@]}"; do
+                if [[ "$would" == *" $member "* ]]; then
+                  record "$kind" "$member"
+                else
+                  echo "==> $label: edge already holds $member at master's version"
+                  record already-published "$member"
+                fi
+              done
             else
               # bin/build plans against the public channel first. If the
               # channel already holds master's version there is nothing to
               # build and nothing to publish: a re-run for a package that
-              # turned out to be fine. Record it and move on.
-              plan=$(CONTAINER_ENGINE=docker bin/build --dry-run --mirror edge --arch "$arch" --package "$package" 2>&1 | grep -E '^==> Plan complete' || true)
-              # "Packages that would build:" followed by nothing means none.
-              if [[ -n "$plan" && -z "$(sed -E 's/.*would build: *//' <<<"$plan" | tr -d '[:space:]')" ]]; then
+              # turned out to be fine. Record it and move on. For a build
+              # group that holds only when no member needs a build.
+              if would=$(would_build "${members[@]}") && [[ -z "${would//[[:space:]]/}" ]]; then
                 echo "==> $label: already published at master's version, nothing to do"
-                jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"already-published"}' >> sources.jsonl
+                record already-published "${members[@]}"
                 continue
               fi
               # Nothing builds here. No artifact means the rebuild failed (see
               # the rebuild job), or an artifact expired between planning and
               # now (re-run all jobs).
               echo "::error::$label: no artifact from the rebuild job"
-              jq -nc --arg p "$package" --arg a "$arch" '{package:$p, arch:$a, source:"build-failed"}' >> sources.jsonl; failed=1; break
+              record build-failed "${members[@]}"; failed=1; break
             fi
-          done < plan.txt
+          done < entries.txt
           ls -1 build-output/edge/*/*.pkg.tar.zst 2>/dev/null || true
           if (( failed )); then
             # Write the record now; the publish step will not run.
@@ -337,6 +394,9 @@ jobs:
             done
             # A collected artifact must yield this package's files; publishing
             # none of them would read as success and leave every channel stale.
+            # plan.txt lists every member of a build group, so this also
+            # refuses a group artifact missing a member that edge does not
+            # already hold, before any slot is touched.
             if (( matched == 0 )) && jq -e --arg p "$package" --arg a "$arch" \
               'select(.package == $p and .arch == $a and .source != "already-published")' sources.jsonl >/dev/null; then
               echo "::error::$package ($arch): its artifact has no files with pkgbase $base"
