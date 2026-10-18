@@ -83,8 +83,12 @@ arch=('x86_64' 'aarch64')
 depends=($2)
 EOF_PKGBUILD
 }
-pair pair-runtime "'bash' 'pair-settings=\${pkgver}'" pair-settings
+pair pair-runtime "'bash' \"pair-settings=\${pkgver}\"" pair-settings
 pair pair-settings "'bash'" pair-runtime
+# The pin must expand the way omarchy's does: settings at this exact version.
+# shellcheck disable=SC1091
+(source "$TEST_ROOT/pkgbuilds/pair-runtime/PKGBUILD" && [[ " ${depends[*]} " == *" pair-settings=4.0.5 "* ]]) ||
+  { echo "FAIL: the pair fixture pins pair-settings=4.0.5"; exit 1; }
 plan_pair() { # plan_pair <arch> <repo>: the packages the plan builds, in order
   rm -rf "$TEST_ROOT/plan"
   ARCH="$1" MIRROR=edge DRY_RUN=true PACKAGES="pair-runtime pair-settings" \
