@@ -1,5 +1,6 @@
 {
   "source": "local",
   "channels": ["edge", "rc", "stable"],
+  "build_with": ["omarchy"],
   "pinned": true
 }

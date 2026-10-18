@@ -1,6 +1,7 @@
 {
   "source": "local",
   "channels": ["edge"],
+  "build_with": ["omarchy-dev"],
   "auto_merge": true,
   "min_release_age": "30m",
   "upstream": {

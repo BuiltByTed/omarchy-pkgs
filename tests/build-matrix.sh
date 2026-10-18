@@ -139,3 +139,25 @@ fixture edge-less x86_64 aarch64 -- '{"source":"local","channels":["stable"],"bu
 fixture edge-full x86_64 aarch64 -- '{"source":"local","build_with":["edge-less"]}'
 refused "edge-less is published to no channel" edge-full
 pass "a group that cannot build as one job is refused, never split"
+
+channels_of() { # the channels a package's own entry lists, as before groups
+  local mirror out=""
+  for mirror in $VALID_MIRRORS; do
+    package_builds_for_mirror "$ROOT/pkgbuilds/$1" "$mirror" && out="$out $mirror"
+  done
+  echo "${out# }"
+}
+# The real declarations: each Omarchy pair is one entry per architecture,
+# whichever half a change touched, with each half published as it was.
+for pair in "omarchy omarchy-settings" "omarchy-dev omarchy-settings-dev"; do
+  for half in $pair; do
+    got=$("$ROOT/bin/build-matrix" "$half")
+    [[ $(jq -c '[.include[] | [.package, .arch]]' <<<"$got") == "[[\"$pair\",\"x86_64\"],[\"$pair\",\"aarch64\"]]" ]] \
+      || fail "$half plans: $got"
+    for member in $pair; do
+      [[ $(jq -r --arg m "$member" '[.include[].members[] | select(.package == $m) | .channels] | unique | join(";")' <<<"$got") == "$(channels_of "$member")" ]] \
+        || fail "$member routing in $got"
+    done
+  done
+done
+pass "the omarchy and omarchy-dev pairs build together and keep their routing"
